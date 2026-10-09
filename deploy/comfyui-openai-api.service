@@ -1,0 +1,18 @@
+[Unit]
+Description=ComfyUI OpenAI API in tmux
+Requires=comfyui.service
+After=network-online.target comfyui.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Comfyui2Openai
+Environment=HOME=/home/ubuntu
+ExecStart=/home/ubuntu/Comfyui2Openai/start_api.sh
+ExecStop=-/usr/bin/tmux kill-session -t ComfyApi
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

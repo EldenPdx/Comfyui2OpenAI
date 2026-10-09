@@ -46,6 +46,23 @@ This allows you to use ComfyUI's powerful image generation workflows with any cl
 2. **Environment Variable (Optional)**:
    You can specify a custom config path via the `CONFIG_PATH` environment variable.
 
+### Optional response delay
+
+Add this top-level section to `apps/api/config/config.yaml` (or the file selected by `CONFIG_PATH`):
+
+```yaml
+delay_layer:
+  enabled: true
+  min_seconds: 3.0
+  max_seconds: 8.0
+```
+
+Each successful `/v1/images/generations` request waits for an independently sampled floating-point duration after all its images have been generated and its response assembled. This covers ordinary and dynamic-batch generation, once per HTTP request rather than per image. The wait is asynchronous; other requests and batch processing continue normally. Response status, headers, extensions, and body are returned unchanged.
+
+The section is optional and disabled by default. Set `enabled: false` to bypass the wait; change the nonnegative `min_seconds` / `max_seconds` values to adjust the range. Omitted bounds default to 3 and 8 seconds. Invalid numeric ranges or recoverable delay failures skip the wait and log a warning; invalid YAML or incorrect field types still follow the existing configuration-load error handling. Errors, health checks, image-download authorization, and other endpoints are not delayed.
+
+Configuration is read at startup: restart the API after changing it, and rebuild first when deploying source changes. Allow for generation time **plus** the maximum delay in client/reverse-proxy timeouts. Published images are protected from periodic cleanup while awaiting their generation response, including the optional delay and body transmission. The configured `image_cleanup.max_age_seconds` retention starts when the complete response body has been handed off to the HTTP transport and its body is released—not when the image was generated. This is a server-side handoff, not proof that the client has received or read the response. Each HTTP request has an independent lifetime, including siblings in one dynamic batch. Cancellation before body handoff removes the undelivered files. Successful one-time image downloads still consume their files immediately. Orphan files after a process restart retain the existing mtime-based safety-net cleanup. Protection is process-local; do not run multiple API processes with cleanup against the same output directory. These lifecycle rules also apply with the delay disabled or its middleware removed; `public_image_access` continues to control download access.
+
 ## 📂 Workflow Setup (Important!)
 
 To use a specific model/workflow via the API, you must export it from ComfyUI in **API Format**.
@@ -107,7 +124,7 @@ The server will start at `http://0.0.0.0:8080`.
 ```bash
 curl http://localhost:8080/v1/images/generations \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-any-token" \
+  -H "Authorization: Bearer $API_KEY" \
   -d '{
     "model": "flux-dev",
     "prompt": "A cyberpunk city at night, neon lights, rain",
@@ -145,3 +162,7 @@ image_url = response.data[0].b64_json
 ## 📝 License
 
 [MIT](LICENSE)
+
+## Current server deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the deployed configuration, service files, and ComfyUI dependencies.

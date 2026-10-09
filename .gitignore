@@ -22,3 +22,8 @@ logs/
 # Optional: User workflows
 # If you want to keep workflows private, uncomment the next line
 # workflows/*.json
+
+# Local snapshots and private runtime configuration backups
+*.before-*
+*.bak-*
+apps/api/config/config.yaml.*

@@ -10,23 +10,30 @@
 //! - WebSocket communication for job tracking
 //! - Workflow loading and management
 //! - Response formatting to match OpenAI standards
-//! - Base64 image encoding for API responses
+//! - One-time URL delivery for generated images
 
 mod config;
+mod backend;
+mod delay;
+mod monitor;
+mod notification;
 mod proxy;
 mod comfyui;
 mod ws;
 
-use axum::{routing::any, Router};
+use axum::{routing::{any, get}, Router};
 use log::info;
 use reqwest::Client;
 use std::{sync::Arc, time::Duration};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
-use config::Config;
+use config::{Config, ImageCleanupConfig};
+use backend::{BackendPool, control_router, register_backend_runtime, run_backend_health_loop};
+use monitor::{monitor_request, run_monitor, Monitor, MonitorConfig};
+use notification::{NotificationConfig, SmtpNotifier};
 use proxy::ProxyState;
 use ws::WebSocketManager;
-use comfyui::WorkflowsLoader;
+use comfyui::{run_image_cleanup_loop, WorkflowsLoader};
 
 /// Entry point for the application with 8 worker threads for handling concurrent requests
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
@@ -57,7 +64,9 @@ async fn main() {
     info!("");
     info!("🔗 ComfyUI Backend Configuration:");
     info!("   Host: {}", config.comfyui_backend.host);
-    info!("   Port: {}", config.comfyui_backend.port);
+    let mut backend_ports = vec![config.comfyui_backend.port.to_string()];
+    backend_ports.extend(config.comfyui_backend.additional_ports.iter().map(u16::to_string));
+    info!("   Ports: {}", backend_ports.join(", "));
     info!("   ClientID: {}", config.comfyui_backend.client_id);
     info!("   Workflows Path: {}", config.comfyui_backend.workflows_folder);
     info!("   Use WebSockets: {}", config.comfyui_backend.use_ws);
@@ -68,6 +77,8 @@ async fn main() {
     info!("");
     info!("📊 Logger Configuration:");
     info!("   Log Level: {}", config.log_level);
+    info!("   Request Monitoring: {}", config.monitoring.enabled);
+    info!("   SMTP Notifications: {}", config.notification.enabled);
     info!("═══════════════════════════════════════════════════════════");
     info!("");
 
@@ -76,12 +87,17 @@ async fn main() {
         config.server.host,
         config.server.port.to_string(),
         config.comfyui_backend.host,
-        config.comfyui_backend.port.to_string(),
+        backend_ports,
         config.comfyui_backend.client_id,
         config.routing.timeout_seconds.into(),
         config.routing.max_payload_size_mb.into(),
         config.comfyui_backend.workflows_folder.into(),
         config.comfyui_backend.use_ws.into(),
+        config.image_cleanup,
+        config.public_image_access,
+        config.delay_layer,
+        config.monitoring,
+        config.notification,
     )
     .await;
 }
@@ -92,7 +108,7 @@ async fn main() {
 /// * `server_addr` - Proxy server bind address (e.g., "127.0.0.1")
 /// * `server_port` - Proxy server bind port (e.g., "8080")
 /// * `backend_addr` - ComfyUI backend address (e.g., "localhost")
-/// * `backend_port` - ComfyUI backend port (e.g., "8188")
+/// * `backend_ports` - ComfyUI backend ports (e.g., "8188", "8189")
 /// * `backend_client_id` - Unique client identifier for ComfyUI WebSocket
 /// * `tcp_timeout` - Request timeout in seconds
 /// * `max_payload_size_mb` - Maximum request body size in MB
@@ -101,12 +117,17 @@ async fn run_server(
     server_addr: String,
     server_port: String,
     backend_addr: String,
-    backend_port: String,
+    backend_ports: Vec<String>,
     backend_client_id: String,
     tcp_timeout: u64,
     max_payload_size_mb: usize,
     workflows_config: String,
     use_ws: bool,
+    image_cleanup: ImageCleanupConfig,
+    public_image_access: bool,
+    delay_layer: delay::DelayConfig,
+    monitoring: MonitorConfig,
+    notification: NotificationConfig,
 ) {
     // Create an optimized HTTP/1.1 client for communicating with ComfyUI backend
     // Configuration prioritizes:
@@ -129,31 +150,6 @@ async fn run_server(
         // Panic on failure as client creation is critical to server startup
         .expect("Failed to create HTTP client");
 
-    // Initialize WebSocket manager for persistent connection to ComfyUI backend
-    // This manages the ws://backend:port/ws?clientId=X connection for job completion tracking
-    // Only initialize if use_ws is enabled in the configuration
-    let ws_manager: Option<Arc<WebSocketManager>> = if use_ws {
-        match WebSocketManager::new(
-            backend_addr.clone(),
-            backend_port.clone(),
-            backend_client_id.clone(),
-        )
-        .await
-        {
-            Ok(manager) => {
-                info!("✅ WebSocket manager initialized successfully");
-                Some(manager)
-            }
-            Err(e) => {
-                eprintln!("Failed to initialize WebSocket manager: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        info!("⏭️  WebSocket support disabled in configuration");
-        None
-    };
-
     // Load all workflow JSON files from the specified directory
     // Workflows are ComfyUI workflow definitions that map to specific models
     let workflows = match WorkflowsLoader::load_from_folder(&workflows_config.to_string()) {
@@ -167,26 +163,101 @@ async fn run_server(
                 }
             };
 
-    // Wrap shared state in Arc (atomic reference counter) to safely share across
-    // concurrent async tasks. This is required for the async handler functions
-    // to access the HTTP client, WebSocket manager, and workflows concurrently.
-    let porxy_state = Arc::new(ProxyState {
-        client,
-        backend_url: backend_addr,
-        backend_port: backend_port,
-        backend_client_id: backend_client_id,
-        max_payload_size_mb: max_payload_size_mb,
-        timeout: tcp_timeout + 10, // Add 10 second buffer to timeout
-        use_ws: use_ws,
-        ws_manager,
-        workflows,
+    let output_directory = image_cleanup.output_directory.clone();
+    tokio::spawn(run_image_cleanup_loop(
+        output_directory.clone(),
+        image_cleanup.interval_seconds,
+        image_cleanup.max_age_seconds,
+    ));
+
+    let backend_pool = Arc::new(BackendPool::new());
+    let primary_port = backend_ports.first().cloned().expect("At least one backend port is required");
+    let direct_ws_manager = if use_ws {
+        match WebSocketManager::new(
+            backend_addr.clone(),
+            primary_port.clone(),
+            format!("{}-direct", backend_client_id),
+        ).await {
+            Ok(manager) => Some(manager),
+            Err(error) => {
+                log::warn!("Primary WebSocket is unavailable; IMG2.0-S can still recover dynamically: {}", error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let proxy_state = Arc::new(ProxyState {
+        client: client.clone(),
+        backend_url: backend_addr.clone(),
+        backend_port: primary_port,
+        backend_client_id: backend_client_id.clone(),
+        max_payload_size_mb,
+        timeout: tcp_timeout + 10,
+        use_ws,
+        ws_manager: direct_ws_manager,
+        workflows: workflows.clone(),
+        output_directory: output_directory.clone(),
+        public_image_access,
+        backend_pool,
     });
+    for backend_port in backend_ports {
+        let port = match backend_port.parse::<u16>() {
+            Ok(port) => port,
+            Err(error) => {
+                log::error!("Invalid configured backend port {}: {}", backend_port, error);
+                continue;
+            }
+        };
+        if let Err(error) = register_backend_runtime(
+            proxy_state.clone(),
+            format!("GPU-port-{}", port),
+            port,
+        ).await {
+            log::warn!("Configured backend {} is not ready: {:?}", port, error);
+        }
+    }
+    tokio::spawn(run_backend_health_loop(proxy_state.clone()));
+
+    let monitor = Monitor::default();
+    if monitoring.enabled {
+        let notifier = match SmtpNotifier::from_config(&notification) {
+            Ok(notifier) => notifier,
+            Err(error) => {
+                log::error!("SMTP notifications unavailable: {}", error);
+                None
+            }
+        };
+        tokio::spawn(run_monitor(
+            monitor.clone(),
+            monitoring.clone(),
+            move |alert| {
+                let notifier = notifier.clone();
+                async move {
+                    log::warn!(
+                        "Request failure alert: kind={:?}, success={}, failed={}, failure_rate={:.2}%",
+                        alert.kind,
+                        alert.snapshot.successful,
+                        alert.snapshot.failed,
+                        alert.failure_rate_percent
+                    );
+                    match notifier {
+                        Some(notifier) => notifier.send(&alert).await,
+                        None => Ok(()),
+                    }
+                }
+            },
+        ));
+    }
 
     // Configure the Axum web server with routing and middleware
-    let app = Router::new()
+    let mut app = Router::new()
+        .route("/health", get(comfyui::health))
         // Route all HTTP methods to /v1/images/* path to match OpenAI API standard
         // This captures paths like /v1/images/generations
         .route("/v1/images/*path", any(proxy::proxy_handler))
+        // Delay only completed image responses, never backend generation or batch work.
+        .layer(axum::middleware::from_fn_with_state(delay_layer, delay::response_delay))
         // Enable CORS to allow requests from any origin
         .layer(CorsLayer::permissive())
         // Set request body size limit to prevent memory exhaustion
@@ -194,7 +265,28 @@ async fn run_server(
             max_payload_size_mb * 1024 * 1024,
         ))
         // Make shared state (client, ws_manager, workflows) available to all handlers
-        .with_state(porxy_state);
+        .with_state(proxy_state.clone());
+    if monitoring.enabled {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            monitor,
+            monitor_request,
+        ));
+    }
+
+    let control_port = server_port.parse::<u16>()
+        .expect("Server port must be numeric")
+        .checked_add(1)
+        .expect("Server port has no adjacent control port");
+    let control_listener = tokio::net::TcpListener::bind(("127.0.0.1", control_port))
+        .await
+        .expect("Failed to bind backend control port");
+    info!("GPU backend control listener running on 127.0.0.1:{}", control_port);
+    let control_state = proxy_state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(control_listener, control_router(control_state)).await {
+            log::error!("GPU backend control listener stopped: {}", error);
+        }
+    });
 
     // Bind the proxy server to the specified address and port
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", server_addr, server_port))

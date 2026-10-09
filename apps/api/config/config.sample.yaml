@@ -13,6 +13,8 @@ comfyui_backend:
   # Where the ComfyUI is deployed
   host: "127.0.0.1"
   port: 8000
+  # Additional local ComfyUI instances used by the dynamic batch scheduler.
+  additional_ports: []
   # Path to folder containing .json workflows files
   workflows_folder: "./workflows"
   # Client ID to use (some string)
@@ -28,3 +30,43 @@ routing:
   # Max payload to accept/transmit
   max_payload_size_mb: 10
 
+
+# Generated image cleanup. Files are deleted after retrieval and stale files are swept periodically.
+image_cleanup:
+  # Must match ComfyUI's output directory.
+  output_directory: "/home/ubuntu/ComfyUI/output"
+  # Scan every second so expired URLs are removed promptly.
+  interval_seconds: 1
+  # Unclaimed published images expire this many seconds after response-body handoff.
+  # Images awaiting delivery are protected, including during the optional delay.
+  # Unmanaged/orphan files fall back to their file modification time.
+  max_age_seconds: 30
+
+# Allow unauthenticated access to generated one-time image URLs.
+# Set to false to keep returning the existing 401 response.
+public_image_access: false
+
+# Optional delay after successful image generation. Restart the API after changes.
+# Omit this section or set enabled: false to preserve immediate responses.
+delay_layer:
+  enabled: false
+  min_seconds: 3.0
+  max_seconds: 8.0
+
+# Optional request outcome monitoring. Failure rate uses each sampling window.
+monitoring:
+  enabled: false
+  failure_rate_threshold_percent: 2.5
+  sample_interval_seconds: 60
+  rising_reminder_seconds: 300
+  unresolved_reminder_seconds: 1800
+
+# Optional SMTP alert delivery. The password is read only from password_env.
+notification:
+  enabled: false
+  host: "smtp.qq.com"
+  port: 587
+  username: "your-account@qq.com"
+  password_env: "SMTP_PASSWORD"
+  from: "your-account@qq.com"
+  to: "admin@example.com"

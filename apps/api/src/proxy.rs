@@ -13,9 +13,17 @@ use log::{error};
 use reqwest::Client;
 use serde::Serialize;
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
+use crate::backend::BackendPool;
 use crate::ws::WebSocketManager;
-use crate::comfyui::{generations_response};
+use crate::comfyui::{generations_response, image_file_response, BatchSender};
 use serde_json::Value;
+
+#[derive(Clone)]
+pub struct BatchQueue {
+    pub sender: BatchSender,
+    pub capacity: Arc<Semaphore>,
+}
 
 /// Shared state passed to all request handlers
 ///
@@ -43,13 +51,19 @@ pub struct ProxyState {
     pub use_ws: bool,
     /// Pre-loaded workflows (workflows) keyed by model name
     pub workflows: Arc<HashMap<String, Value>>,
+    /// ComfyUI output directory for generated image cleanup
+    pub output_directory: String,
+    /// Whether public one-time image URLs may return image bytes.
+    pub public_image_access: bool,
+    /// Runtime registry for IMG2.0-S batch backends.
+    pub backend_pool: Arc<BackendPool>,
 }
 
 /// Error types for proxy operations
 ///
 /// Categorizes different error scenarios to enable appropriate HTTP status codes
 /// and error messages in responses
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ProxyError {
     /// Internal server errors (500)
     Internal(String),
@@ -62,6 +76,15 @@ pub enum ProxyError {
     Validation(String),
     /// Unimplemented features (400)
     Implementation(String),
+    /// Dynamic batch queue is full (429)
+    Busy(String),
+    /// Dynamic batch worker is unavailable (503)
+    Unavailable(String),
+    /// Image download access is denied (401)
+    Unauthorized(String),
+    /// Requested image URL has expired or was already consumed (404)
+    #[allow(dead_code)]
+    NotFound(String),
 }
 
 /// HTTP response body for error messages
@@ -97,6 +120,20 @@ impl IntoResponse for ProxyError {
                 error!("❌ Implementation error: {}", msg);
                 (StatusCode::BAD_REQUEST, "IMPLEMENTATION_ERROR", msg)
             }
+            ProxyError::Busy(msg) => {
+                error!("❌ Batch queue full: {}", msg);
+                (StatusCode::TOO_MANY_REQUESTS, "TOO_MANY_REQUESTS", msg)
+            }
+            ProxyError::Unavailable(msg) => {
+                error!("❌ Batch worker unavailable: {}", msg);
+                (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", msg)
+            }
+            ProxyError::Unauthorized(msg) => {
+                (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg)
+            }
+            ProxyError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, "NOT_FOUND", msg)
+            }
 
         };
 
@@ -105,7 +142,14 @@ impl IntoResponse for ProxyError {
             message,
         };
 
-        (status, axum::Json(error_response)).into_response()
+        let mut response = (status, axum::Json(error_response)).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer realm=\"images\""),
+            );
+        }
+        response
     }
 }
 
@@ -189,19 +233,19 @@ pub async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
     Path(path): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    _method: Method,
+    method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Result<AxumResponse, ProxyError> {
 
-    // Generate a short ID for tracking this request
-    let req_id = uuid::Uuid::new_v4().to_string().chars().take(8).collect::<String>();
+    // Use a full UUID so it is also safe as the per-request output filename suffix.
+    let req_id = uuid::Uuid::new_v4().to_string();
     
     // Log request start with visual separator
     log::info!("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓");
     log::info!("┃ 🚀 REQUEST START [{}]", req_id);
     log::info!("┃ 📍 Path: /v1/images/{}", path);
-    log::info!("┃ 🔗 Method: POST"); // We only really handle POST for generations
+    log::info!("┃ 🔗 Method: {}", method);
     log::info!("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛");
 
     // Route based on the requested endpoint
@@ -210,6 +254,13 @@ pub async fn proxy_handler(
         "generations" => {
             generations_response(State(state), Query(params), headers, body, &req_id).await
         }
+        "gpu-count" if method == Method::GET => Ok(axum::Json(serde_json::json!({
+            "gpu_count": state.backend_pool.ready_count()
+        })).into_response()),
+        "gpu-count" => Err(ProxyError::Implementation("GPU count only supports GET requests".to_string())),
+        "files" if !state.public_image_access => Err(ProxyError::Unauthorized("Unauthorized. You are not on the authorized user whitelist.".to_string())),
+        "files" if method == Method::GET => image_file_response(&state.output_directory, params).await,
+        "files" => Err(ProxyError::Implementation("Image files only support GET requests".to_string())),
         // Reject unsupported endpoints
         _ => {
             error!("❌ [{}] Path not supported: {}", req_id, path);
@@ -237,4 +288,140 @@ pub async fn proxy_handler(
     }
 
     result
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn image_download_route_is_disabled_without_consuming_files() {
+        let root = std::env::temp_dir().join(format!("comfyui-disabled-download-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let filename = format!("image-{}.png", uuid::Uuid::new_v4());
+        let image = root.join(&filename);
+        std::fs::write(&image, b"image must remain for periodic cleanup").unwrap();
+        let (batch_sender, _receiver, batch_capacity) = crate::comfyui::dynamic_batch_channel();
+        let backend_pool = Arc::new(crate::backend::BackendPool::new());
+        let state = Arc::new(ProxyState {
+            client: Client::new(),
+            backend_url: "127.0.0.1".to_string(),
+            backend_port: "8188".to_string(),
+            backend_client_id: "test".to_string(),
+            max_payload_size_mb: 10,
+            timeout: 30,
+            ws_manager: None,
+            use_ws: false,
+            workflows: Arc::new(HashMap::new()),
+            output_directory: root.to_string_lossy().into_owned(),
+            public_image_access: false,
+            backend_pool: backend_pool.clone(),
+        });
+        backend_pool.add_ready("test".to_string(), state.clone(), BatchQueue { sender: batch_sender, capacity: batch_capacity });
+        let params = HashMap::from([("filename".to_string(), filename)]);
+        for method in [Method::GET, Method::HEAD, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
+            let result = proxy_handler(
+                State(state.clone()), Path("files".to_string()), Query(params.clone()),
+                method.clone(), HeaderMap::new(), Body::empty(),
+            ).await;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => error.into_response(),
+            };
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{} must not serve images", method);
+            assert_eq!(response.headers()["www-authenticate"], "Bearer realm=\"images\"");
+            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body, serde_json::json!({ "code": 401, "message": "Unauthorized. You are not on the authorized user whitelist." }));
+            assert_eq!(std::fs::read(&image).unwrap(), b"image must remain for periodic cleanup");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_image_download_returns_and_consumes_the_file() {
+        let root = std::env::temp_dir().join(format!("comfyui-enabled-download-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let filename = format!("image-{}.png", uuid::Uuid::new_v4());
+        let image = root.join(&filename);
+        std::fs::write(&image, b"png bytes").unwrap();
+        let (batch_sender, _receiver, batch_capacity) = crate::comfyui::dynamic_batch_channel();
+        let backend_pool = Arc::new(crate::backend::BackendPool::new());
+        let state = Arc::new(ProxyState {
+            client: Client::new(),
+            backend_url: "127.0.0.1".to_string(),
+            backend_port: "8188".to_string(),
+            backend_client_id: "test".to_string(),
+            max_payload_size_mb: 10,
+            timeout: 30,
+            ws_manager: None,
+            use_ws: false,
+            workflows: Arc::new(HashMap::new()),
+            output_directory: root.to_string_lossy().into_owned(),
+            public_image_access: true,
+            backend_pool: backend_pool.clone(),
+        });
+        backend_pool.add_ready("test".to_string(), state.clone(), BatchQueue { sender: batch_sender, capacity: batch_capacity });
+        let params = HashMap::from([
+            ("filename".to_string(), filename),
+            ("subfolder".to_string(), String::new()),
+            ("type".to_string(), "output".to_string()),
+        ]);
+
+        let response = proxy_handler(
+            State(state.clone()), Path("files".to_string()), Query(params.clone()),
+            Method::GET, HeaderMap::new(), Body::empty(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(axum::body::to_bytes(response.into_body(), 1024).await.unwrap(), "png bytes");
+        assert!(!image.exists());
+
+        let second = proxy_handler(
+            State(state), Path("files".to_string()), Query(params),
+            Method::GET, HeaderMap::new(), Body::empty(),
+        ).await.unwrap_err();
+        assert!(matches!(second, ProxyError::NotFound(_)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gpu_count_route_reports_ready_backends_and_requires_get() {
+        let (batch_sender, _receiver, batch_capacity) = crate::comfyui::dynamic_batch_channel();
+        let backend_pool = Arc::new(crate::backend::BackendPool::new());
+        let state = Arc::new(ProxyState {
+            client: Client::new(),
+            backend_url: "127.0.0.1".to_string(),
+            backend_port: "8188".to_string(),
+            backend_client_id: "test".to_string(),
+            max_payload_size_mb: 10,
+            timeout: 30,
+            ws_manager: None,
+            use_ws: false,
+            workflows: Arc::new(HashMap::new()),
+            output_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            public_image_access: false,
+            backend_pool: backend_pool.clone(),
+        });
+        backend_pool.add_ready(
+            "GPU-test".to_string(),
+            state.clone(),
+            BatchQueue { sender: batch_sender, capacity: batch_capacity },
+        );
+
+        let response = proxy_handler(
+            State(state.clone()), Path("gpu-count".to_string()), Query(HashMap::new()),
+            Method::GET, HeaderMap::new(), Body::empty(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), serde_json::json!({"gpu_count": 1}));
+
+        let error = proxy_handler(
+            State(state), Path("gpu-count".to_string()), Query(HashMap::new()),
+            Method::POST, HeaderMap::new(), Body::empty(),
+        ).await.unwrap_err();
+        assert!(matches!(error, ProxyError::Implementation(_)));
+    }
 }

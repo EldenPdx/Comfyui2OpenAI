@@ -1,0 +1,40 @@
+# Sanitized snapshot of the GPU server configuration.
+# Adjust absolute paths for the target server. Configure SMTP separately.
+log_level: info
+server:
+  host: 127.0.0.1
+  port: 18081
+comfyui_backend:
+  host: 127.0.0.1
+  port: 8188
+  additional_ports:
+  - 8189
+  workflows_folder: ./workflows
+  client_id: comfyui-api
+  use_ws: true
+routing:
+  timeout_seconds: 600
+  max_payload_size_mb: 10
+image_cleanup:
+  output_directory: /home/ubuntu/ComfyUI/output
+  interval_seconds: 1
+  max_age_seconds: 30
+public_image_access: true
+delay_layer:
+  enabled: false
+  min_seconds: 3.0
+  max_seconds: 8.0
+monitoring:
+  enabled: true
+  failure_rate_threshold_percent: 2.5
+  sample_interval_seconds: 60
+  rising_reminder_seconds: 300
+  unresolved_reminder_seconds: 1800
+notification:
+  enabled: false
+  host: smtp.qq.com
+  port: 587
+  username: your-account@qq.com
+  password_env: SMTP_PASSWORD
+  from: your-account@qq.com
+  to: admin@example.com

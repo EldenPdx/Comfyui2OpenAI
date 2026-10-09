@@ -1,0 +1,28 @@
+{
+	admin 127.0.0.1:2019
+	auto_https off
+}
+
+http://:8080 {
+	log {
+		output file /var/log/caddy/comfy-api-access.log {
+			roll_size 100MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+
+	reverse_proxy 127.0.0.1:18081 {
+		health_uri /health
+		health_interval 5s
+		health_timeout 2s
+		health_status 200
+
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 650s
+			keepalive 30s
+		}
+	}
+}

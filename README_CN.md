@@ -46,6 +46,23 @@
 2. **环境变量 (可选)**:
    你可以通过设置 `CONFIG_PATH` 环境变量来指定配置文件的路径。
 
+### 可选响应延迟
+
+在 `apps/api/config/config.yaml`（或 `CONFIG_PATH` 指定的配置文件）顶层添加：
+
+```yaml
+delay_layer:
+  enabled: true
+  min_seconds: 3.0
+  max_seconds: 8.0
+```
+
+每个成功的 `/v1/images/generations` 请求，在所有图片生成完成、响应组装完毕后，独立随机等待上述范围内的浮点秒数。普通生成和动态批处理均适用，每个 HTTP 请求只延迟一次，而非每张图片一次。异步等待不会阻塞其他请求或批处理，响应状态码、响应头、扩展信息及响应体保持原样。
+
+配置项可省略，默认关闭。设置 `enabled: false` 可直接跳过延迟；修改非负的 `min_seconds` / `max_seconds` 可调整范围，省略上下界时分别使用 3 和 8 秒。无效数值范围或可恢复的延迟异常会记录警告并跳过等待；YAML 格式或字段类型错误仍按既有配置加载错误处理。错误响应、健康检查、图片下载鉴权和其他接口不延迟。
+
+配置在启动时读取，修改后须重启 API；部署源码变更时需先重新构建。客户端和反向代理超时应覆盖“生成耗时 + 最大延迟”。生成响应等待交付期间（包括可选延迟和响应体传输），已发布图片受保护，不会被定时清理。完整响应体交给 HTTP 传输层并释放响应体后，才开始计算 `image_cleanup.max_age_seconds` 保留期，而不是从图片生成时计算。这是服务端交付边界，不代表客户端已经收到或读取。每个 HTTP 请求独立计时，同一动态批次中的不同请求也互不影响；交付前取消请求会回收未交付图片。一次性图片下载成功后仍立即删除对应文件。进程重启后的孤儿文件继续按文件修改时间兜底清理。保护登记为进程内状态，不应让多个 API 进程同时清理同一个输出目录。关闭延迟或移除延迟中间件时，这些生命周期规则仍然生效；图片下载权限仍由 `public_image_access` 控制。
+
 ## 📂 工作流设置 (重要!)
 
 要通过 API 使用特定的模型/工作流，你必须从 ComfyUI 中以 **API 格式** 导出它。
@@ -110,7 +127,7 @@ cargo build --release
 ```bash
 curl http://localhost:8080/v1/images/generations \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-any-token" \
+  -H "Authorization: Bearer $API_KEY" \
   -d '{
     "model": "flux-dev",
     "prompt": "A cyberpunk city at night, neon lights, rain",
@@ -151,3 +168,7 @@ image_url = response.data[0].b64_json
 ## 📝 许可证
 
 [MIT](LICENSE)
+
+## 当前服务器部署
+
+当前配置、服务文件和 ComfyUI 依赖见 [DEPLOYMENT.md](DEPLOYMENT.md)。

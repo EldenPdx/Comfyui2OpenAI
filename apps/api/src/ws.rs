@@ -25,6 +25,8 @@ const COMPLETED_JOBS_CAPACITY: usize = 100;
 const INITIAL_RECONNECT_DELAY_SECS: u64 = 2;
 const MAX_RECONNECT_DELAY_SECS: u64 = 60;
 const RECONNECT_BACKOFF_MULTIPLIER: f64 = 1.5;
+const COMPLETION_POLL_INTERVAL_MS: u64 = 25;
+const HISTORY_POLL_INTERVAL_TICKS: u64 = 80;
 
 /// A circular buffer for efficiently tracking recently completed task IDs
 ///
@@ -172,9 +174,8 @@ impl WebSocketManager {
 
         loop {
             loop {
-                // Use timeout detection to prevent hanging connections (no data sent) from waiting indefinitely
-                match tokio::time::timeout(Duration::from_secs(60), read.next()).await {
-                    Ok(Some(Ok(msg))) => {
+                match read.next().await {
+                    Some(Ok(msg)) => {
                         // Received successful message, reset retry state
                         retry_count = 0;
                         retry_delay = Duration::from_secs(INITIAL_RECONNECT_DELAY_SECS);
@@ -226,17 +227,14 @@ impl WebSocketManager {
                             }
                         }
                     }
-                    Ok(Some(Err(e))) => {
+                    Some(Err(e)) => {
                         // WebSocket error occurred
                         error!("❌ WebSocket error: {}", e);
                         break; // Exit inner loop to trigger reconnection
                     }
-                    Ok(None) => {
+                    None => {
                         // Server closed connection
                         error!("❌ WebSocket connection closed by server");
-                        break; // Exit inner loop to trigger reconnection
-                    }
-                    Err(_) => { // Timeout
                         break; // Exit inner loop to trigger reconnection
                     }
                 }
@@ -297,7 +295,7 @@ impl WebSocketManager {
 
     /// Waits for a job to complete by polling the `completed_jobs` buffer
     ///
-    /// This function blocks (checking every 500ms) until the specified `job_id` appears in the buffer.
+    /// This function blocks (checking every 25ms) until the specified `job_id` appears in the buffer.
     /// Since the background listener updates the buffer in real-time, this effectively waits for the WebSocket message.
     ///
     /// # Arguments
@@ -310,7 +308,11 @@ impl WebSocketManager {
     /// # Blocking Warning
     /// This function runs in an async context but will delay the current async task.
     /// Should only be called within an async Handler.
-    pub async fn wait_for_job_completion(&self, prompt_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn wait_for_job_completion(
+        &self,
+        prompt_id: &str,
+        authorization: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         debug!("⏳ Waiting for job completion for prompt_id: {}", prompt_id);
 
         let mut check_count = 0;
@@ -323,10 +325,10 @@ impl WebSocketManager {
                 }
             }
 
-            // 2. Fallback: Poll History API every 2 seconds (4 ticks)
+            // 2. Fallback: Poll History API every 2 seconds.
             // Used to prevent infinite waiting if WebSocket misses a message
             check_count += 1;
-            if check_count % 4 == 0 {
+            if check_count % HISTORY_POLL_INTERVAL_TICKS == 0 {
                  let history_url = format!("http://{}:{}/history/{}", self.backend_url, self.backend_port, prompt_id);
                  // Silent poll: Log only on success or error to reduce noise
 
@@ -335,7 +337,11 @@ impl WebSocketManager {
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
 
-                 match client.get(&history_url).send().await {
+                 let mut request = client.get(&history_url);
+                 if let Some(authorization) = authorization {
+                     request = request.header(reqwest::header::AUTHORIZATION, authorization);
+                 }
+                 match request.send().await {
                       Ok(resp) => {
                           if resp.status().is_success() {
                                match resp.json::<serde_json::Value>().await {
@@ -361,8 +367,60 @@ impl WebSocketManager {
                  }
             }
 
-            // Sleep briefly to avoid busy-waiting and yield CPU
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // ponytail: one batch waiter makes cheap polling simpler than a notification registry.
+            tokio::time::sleep(Duration::from_millis(COMPLETION_POLL_INTERVAL_MS)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::SinkExt;
+    use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn websocket_completion_wakes_waiter_within_100ms() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (send_completion, receive_completion) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            receive_completion.await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "execution_success",
+                        "data": { "prompt_id": "job-1" }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let manager = WebSocketManager::new(
+            "127.0.0.1".to_string(),
+            port.to_string(),
+            "test-client".to_string(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send_completion.send(()).unwrap();
+        });
+
+        timeout(
+            Duration::from_millis(100),
+            manager.wait_for_job_completion("job-1", None),
+        )
+        .await
+        .expect("WebSocket completion should wake the waiter without polling delay")
+        .unwrap();
+        server.abort();
     }
 }
